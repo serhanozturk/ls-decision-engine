@@ -1,0 +1,1 @@
+# Hicbir dis paket gerekmez - app.py sadece Python stdlib kullanir.
