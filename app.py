@@ -1097,13 +1097,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/cron-check":
             try:
                 data = analyze_symbol("BTC", "flat", None)
-                self._json(200, {"ok": True,
-                    "action": data.get("decision", {}).get("action"),
-                    "regime": data.get("decision", {}).get("regime"),
-                    "bull": data.get("decision", {}).get("bullScore"),
-                    "bear": data.get("decision", {}).get("bearScore"),
-                    "saved": data.get("signalSaved", False),
-                    "supabase": SUPABASE_ENABLED})
+                if not data.get("ok"):
+                    # Analiz basarisiz (ban vb) - durust raporla
+                    self._json(200, {"ok": False,
+                        "error": data.get("error", "analiz basarisiz"),
+                        "supabase": SUPABASE_ENABLED})
+                else:
+                    dec = data.get("decision", {})
+                    self._json(200, {"ok": True,
+                        "action": dec.get("action"),
+                        "regime": dec.get("regime"),
+                        "bull": dec.get("bullScore"),
+                        "bear": dec.get("bearScore"),
+                        "price": data.get("currentPrice"),
+                        "saved": data.get("signalSaved", False),
+                        "supabase": SUPABASE_ENABLED})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
