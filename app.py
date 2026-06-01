@@ -28,7 +28,7 @@ SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 THRESHOLDS = {
     "wr_bull":   3.0,    # W/R >= +3 boga kosulu
     "wr_bear":  -3.0,    # W/R <= -3 ayi kosulu
-    "retail_trend_min": 0.15,  # retail "degisiyor" sayilmasi icin min % (son 2 mum)
+    "retail_trend_min": 0.15,  # retail "degisiyor" sayilmasi icin min % (1 onceki muma gore)
     "oi_min":    0.3,    # OI "artiyor/dusuyor" min %
     "price_min": 0.1,    # fiyat "artiyor/dusuyor" min %
     "cvd_buy":   55.0,   # CVD alim baskisi
@@ -278,7 +278,7 @@ def fetch_h1_data(sym):
 
     # NOT: Binance dizilerinde son eleman aktif/canli mumdur, dalgalanir.
     # Bu yuzden limit=4 cekip son elemani (canli) atliyoruz.
-    # Kalan kapanmis mumlardan: now = son kapanmis [-1], 2ago = [-3]
+    # Kalan kapanmis mumlardan: now = son kapanmis [-1], prev = 1 onceki [-2] (trend icin)
 
     # 1) Global L/S account ratio
     g = http_get_cached(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={sym}&period={p}&limit=4")
@@ -286,31 +286,32 @@ def fetch_h1_data(sym):
         raise RuntimeError("global ratio yok")
     gc = g[:-1] if len(g) >= 4 else g  # canli mumu at
     global_long_now = float(gc[-1]["longAccount"]) * 100
-    global_long_2ago = float(gc[-3]["longAccount"]) * 100 if len(gc) >= 3 else float(gc[0]["longAccount"]) * 100
+    # Trend icin 1 mum oncesi (son hareketi gormek icin - 2 mum oncesi degil)
+    global_long_prev = float(gc[-2]["longAccount"]) * 100 if len(gc) >= 2 else global_long_now
 
     # 2) Top trader position ratio (whale)
     t = safe(lambda: http_get_cached(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={sym}&period={p}&limit=4"), [])
     tc = t[:-1] if t and len(t) >= 4 else t
     whale_now = float(tc[-1]["longAccount"]) * 100 if tc else None
-    whale_2ago = float(tc[-3]["longAccount"]) * 100 if tc and len(tc) >= 3 else (float(tc[0]["longAccount"]) * 100 if tc else None)
+    whale_prev = float(tc[-2]["longAccount"]) * 100 if tc and len(tc) >= 2 else (whale_now if tc else None)
 
     # True retail (cikarma)
-    retail_now = retail_2ago = None
+    retail_now = retail_prev = None
     # Retail turetme formulu - Hyblock True Retail Longs'a kalibre edildi (47 nokta, mutlak ort hata 0.42)
     # Eski: (global - whale*0.2)/0.8 -> sistematik +0.6 sapma vardi. Yeni katsayilar Hyblock'la cakisik.
     if whale_now is not None:
         retail_now = max(0, min(100, (global_long_now - whale_now * 0.065) / 0.938))
-    if whale_2ago is not None:
-        retail_2ago = max(0, min(100, (global_long_2ago - whale_2ago * 0.065) / 0.938))
+    if whale_prev is not None:
+        retail_prev = max(0, min(100, (global_long_prev - whale_prev * 0.065) / 0.938))
 
     # 3) OI - kapanmis mum
     oi = safe(lambda: http_get_cached(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period={p}&limit=4"), [])
     oic = oi[:-1] if oi and len(oi) >= 4 else oi
     oi_now = float(oic[-1].get("sumOpenInterestValue") or 0) if oic else None
-    oi_2ago = float(oic[-3].get("sumOpenInterestValue") or 0) if oic and len(oic) >= 3 else None
+    oi_prev = float(oic[-2].get("sumOpenInterestValue") or 0) if oic and len(oic) >= 2 else None
     oi_change = None
-    if oi_now and oi_2ago and oi_2ago > 0:
-        oi_change = (oi_now - oi_2ago) / oi_2ago * 100
+    if oi_now and oi_prev and oi_prev > 0:
+        oi_change = (oi_now - oi_prev) / oi_prev * 100
 
     # 4) Fiyat - kline (EMA icin 400 mum). Son eleman CANLI mum - EMA icin tut ama
     #    fiyat trendi icin kapanmis kullan.
@@ -318,25 +319,21 @@ def fetch_h1_data(sym):
     closes_all = [float(k[4]) for k in kl]  # canli mum dahil (EMA hesabi icin)
     closes_closed = closes_all[:-1]  # canli mumu at (fiyat trendi + EMA365 rejim icin)
     price_now = closes_closed[-1]    # son KAPANMIS fiyat
-    price_2ago = closes_closed[-3] if len(closes_closed) >= 3 else closes_closed[0]
-    price_change = (price_now - price_2ago) / price_2ago * 100 if price_2ago > 0 else None
+    price_prev = closes_closed[-2] if len(closes_closed) >= 2 else closes_closed[0]
+    price_change = (price_now - price_prev) / price_prev * 100 if price_prev > 0 else None
 
-    # 5) CVD - taker buy/sell, kapanmis mum + 3 nokta agirlikli ortalama
+    # 5) CVD - taker buy/sell, kapanmis mum. Son kapanmis mum + 1 onceki (trend icin)
     cvd = safe(lambda: http_get_cached(f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={sym}&period={p}&limit=5"), [])
     cvdc = cvd[:-1] if cvd and len(cvd) >= 5 else cvd  # canli mumu at
-    taker_buy_now = taker_buy_2ago = None
+    taker_buy_now = taker_buy_prev = None
     if cvdc:
         def buy_pct(point):
             b = float(point.get("buyVol") or 0); s = float(point.get("sellVol") or 0)
             return b / (b + s) * 100 if (b + s) > 0 else None
         pcts = [buy_pct(pt) for pt in cvdc if buy_pct(pt) is not None]
         if pcts:
-            if len(pcts) >= 3:
-                taker_buy_now = pcts[-1] * 0.5 + pcts[-2] * 0.3 + pcts[-3] * 0.2
-                taker_buy_2ago = pcts[0]
-            else:
-                taker_buy_now = pcts[-1]
-                taker_buy_2ago = pcts[0]
+            taker_buy_now = pcts[-1]                       # son kapanmis mum
+            taker_buy_prev = pcts[-2] if len(pcts) >= 2 else pcts[-1]  # 1 onceki
 
     # 6) Funding (sadece gosterim icin)
     funding = None
@@ -389,13 +386,13 @@ def fetch_h1_data(sym):
         "priceChange": price_change,
         "globalLongNow": global_long_now,
         "whaleNow": whale_now,
-        "whale2ago": whale_2ago,
+        "whale2ago": whale_prev,
         "retailNow": retail_now,
-        "retail2ago": retail_2ago,
+        "retail2ago": retail_prev,
         "oiNow": oi_now,
         "oiChange": oi_change,
         "takerBuyNow": taker_buy_now,
-        "takerBuy2ago": taker_buy_2ago,
+        "takerBuy2ago": taker_buy_prev,
         "funding": funding,
         "ema365": round(ema365_now, 2) if ema365_now else None,
         "ema7": round(ema7[-1], 2) if ema7[-1] else None,
