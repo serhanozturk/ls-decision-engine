@@ -254,6 +254,59 @@ def get_signal_history(symbol, limit=50):
         return []
 
 
+# --- IZOLE SNAPSHOT TEST FONKSIYONLARI (mevcut sistemi etkilemez) ---
+def save_snapshot(symbol="BTC"):
+    """5 gunluk OI/CVD matris testi icin saatlik snapshot. Histerezis: 50dk."""
+    if not SUPABASE_ENABLED:
+        return {"ok": False, "error": "supabase kapali"}
+    # Histerezis: son kayittan 50dk gecmediyse atla (saatte bir olsun, 30dk cron'larin biri atlanir)
+    try:
+        latest = supabase_request("GET", "snapshots?order=ts.desc&limit=1")
+        if latest and len(latest) > 0:
+            from datetime import datetime, timezone, timedelta
+            last_ts = datetime.fromisoformat(latest[0].get("ts", "").replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - last_ts < timedelta(minutes=50):
+                return {"ok": True, "saved": False, "reason": "50dk gecmedi (saatlik kayit)"}
+    except Exception:
+        pass
+    # analyze_symbol'u CAGIRRIR (degistirmez) - veriyi oradan alir
+    res = analyze_symbol(symbol, "flat", None)
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error", "analiz hatasi")}
+    d = res.get("data", {})
+    dec = res.get("decision", {})
+    c = dec.get("conditions", {})
+    body = {
+        "symbol": symbol,
+        "price": d.get("priceNow"),
+        "price_change": d.get("priceChange"),
+        "oi": d.get("oiNow"),
+        "oi_change": d.get("oiChange"),
+        "cvd": d.get("takerBuyNow"),
+        "bull_oi": c.get("bull_oi", 0),
+        "bear_oi": c.get("bear_oi", 0),
+        "bull_cvd": c.get("bull_cvd", 0),
+        "bear_cvd": c.get("bear_cvd", 0),
+        "bull_score": dec.get("bullScore", 0),
+        "bear_score": dec.get("bearScore", 0),
+        "action": dec.get("action"),
+        "regime": dec.get("regime"),
+        "ema_cross": dec.get("emaCross"),
+    }
+    result = supabase_request("POST", "snapshots", body)
+    return {"ok": True, "saved": result is not None, "snapshot": body}
+
+
+def get_snapshots(limit=200):
+    if not SUPABASE_ENABLED:
+        return {"ok": False, "error": "supabase kapali"}
+    try:
+        rows = supabase_request("GET", f"snapshots?order=ts.desc&limit={limit}") or []
+        return {"ok": True, "count": len(rows), "snapshots": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # ======================================================================
 # EMA HESAPLAMA
 # ======================================================================
@@ -895,6 +948,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "signals": hist, "supabaseEnabled": SUPABASE_ENABLED})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e), "supabaseEnabled": SUPABASE_ENABLED})
+            return
+
+        # --- IZOLE SNAPSHOT TEST (5 gunluk OI/CVD matris testi) - mevcut sistemi etkilemez ---
+        if path == "/api/snapshot-save":
+            try:
+                self._json(200, save_snapshot("BTC"))
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+
+        if path == "/api/snapshots":
+            try:
+                limit = max(1, min(int(q.get("limit", ["200"])[0]), 500))
+            except ValueError:
+                limit = 200
+            try:
+                self._json(200, get_snapshots(limit))
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
             return
 
         self._json(404, {"ok": False, "error": "not found"})
