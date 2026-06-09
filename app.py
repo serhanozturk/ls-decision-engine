@@ -276,6 +276,7 @@ def save_snapshot(symbol="BTC"):
     d = res.get("data", {})
     dec = res.get("decision", {})
     c = dec.get("conditions", {})
+    st = res.get("serverTime", {})  # tr/utc/candle zaman bilgisi (analyze_symbol uretir)
     body = {
         "symbol": symbol,
         "price": d.get("priceNow"),
@@ -292,6 +293,15 @@ def save_snapshot(symbol="BTC"):
         "action": dec.get("action"),
         "regime": dec.get("regime"),
         "ema_cross": dec.get("emaCross"),
+        # W/R + retail test alanlari (manuel Hyblock dogrulamasi icin)
+        "global_long": d.get("globalLongNow"),
+        "whale": d.get("whaleNow"),
+        "retail": d.get("retailNow"),       # = global (turetme yok)
+        "wr_delta": dec.get("wrDelta"),      # whale - global
+        # Zaman alanlari (UTC/TR karisikligini onlemek icin acik string)
+        "tr_time": st.get("tr"),             # kayit ani TR: "2026-06-09 00:12:36 TR"
+        "utc_time": st.get("utc"),           # kayit ani UTC: "2026-06-08 21:12:36 UTC"
+        "candle_tr": st.get("shownCandleFullTR"),  # analiz edilen MUM (TR): "08.06.2026 23:00 TR"
     }
     result = supabase_request("POST", "snapshots", body)
     return {"ok": True, "saved": result is not None, "snapshot": body}
