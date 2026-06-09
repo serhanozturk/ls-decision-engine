@@ -187,35 +187,27 @@ def supabase_request(method, path, body=None):
 
 
 def save_signal_if_meaningful(symbol, decision, price):
-    """Anlamli sinyalleri kaydet: acilis (kesin/guclu/gamble) + kapatmalar."""
+    """Anlamli sinyalleri kaydet. DEDUP: sadece aksiyon DEGISINCE kaydet.
+    Son kayitli aksiyonla ayniysa atla (sure siniri yok) -> gecmis sadece gecisleri gosterir."""
     if not SUPABASE_ENABLED:
         return False
     saveable = {
         "LONG_OPEN", "SHORT_OPEN", "REBOUND_LONG", "PULLBACK_SHORT",
         "CLOSE", "CLOSE_TP", "CLOSE_SL",
     }
-    if decision.get("action") not in saveable:
+    na = decision.get("action")
+    if na not in saveable:
         return False
 
-    # Histerezis: ayni aksiyon 45dk, ayni aile 10dk
+    # DEDUP: son kayitli sinyalin aksiyonu ile ayniysa kaydetme (sure fark etmez).
+    # Boylece ayni sinyal (orn. surekli REBOUND_LONG) saatlerce tekrar kaydedilmez,
+    # sadece aksiyon degisince (gecis aninda) yeni kayit dusulur.
     try:
         latest = supabase_request("GET", f"signals?symbol=eq.{symbol}&order=ts.desc&limit=1")
         if latest and len(latest) > 0:
-            last = latest[0]
-            from datetime import datetime, timezone, timedelta
-            try:
-                last_ts = datetime.fromisoformat(last.get("ts", "").replace("Z", "+00:00"))
-                elapsed = datetime.now(timezone.utc) - last_ts
-                la = last.get("action", "")
-                na = decision.get("action", "")
-                if la == na and elapsed < timedelta(minutes=45):
-                    return False
-                opens = {"LONG_OPEN", "SHORT_OPEN", "REBOUND_LONG", "PULLBACK_SHORT"}
-                closes = {"CLOSE", "CLOSE_TP", "CLOSE_SL"}
-                if ((la in opens and na in opens) or (la in closes and na in closes)) and elapsed < timedelta(minutes=10):
-                    return False
-            except Exception:
-                pass
+            last_action = latest[0].get("action", "")
+            if last_action == na:
+                return False
     except Exception:
         pass
 
