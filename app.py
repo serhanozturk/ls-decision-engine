@@ -269,6 +269,32 @@ def save_snapshot(symbol="BTC"):
     dec = res.get("decision", {})
     c = dec.get("conditions", {})
     st = res.get("serverTime", {})  # tr/utc/candle zaman bilgisi (analyze_symbol uretir)
+
+    # ===== STALE/TEKRAR KORUMASI =====
+    # Ban veya veri kesintisinde sistem eski mumu tekrar yazabiliyordu (STALE).
+    # Iki kontrol:
+    #  1) candle_tr (analiz edilen mum) son kayitla AYNIYSA -> ayni mumu tekrar kaydetme
+    #  2) price+oi+cvd son kayitla BIREBIR ayniysa -> Binance verisi guncellenmemis (bayat)
+    this_candle = st.get("shownCandleFullTR")
+    this_price = d.get("priceNow")
+    this_oi = d.get("oiNow")
+    this_cvd = d.get("takerBuyNow")
+    try:
+        prev = supabase_request("GET", f"snapshots?symbol=eq.{symbol}&order=ts.desc&limit=1")
+        if prev and len(prev) > 0:
+            p = prev[0]
+            # 1) Ayni mum (candle_tr) tekrar -> atla
+            if this_candle and p.get("candle_tr") == this_candle:
+                return {"ok": True, "saved": False, "reason": f"ayni mum ({this_candle}) zaten kayitli"}
+            # 2) Deger birebir ayni (veri guncellenmemis = bayat/STALE) -> atla
+            same_price = (this_price is not None and p.get("price") == this_price)
+            same_oi = (this_oi is not None and p.get("oi") == this_oi)
+            same_cvd = (this_cvd is not None and p.get("cvd") == this_cvd)
+            if same_price and same_oi and same_cvd:
+                return {"ok": True, "saved": False, "reason": "veri bayat (price+oi+cvd onceki ile birebir ayni) - STALE atlandi"}
+    except Exception:
+        pass
+
     body = {
         "symbol": symbol,
         "price": d.get("priceNow"),
@@ -383,13 +409,20 @@ def fetch_h1_data(sym):
     retail_prev = global_long_prev
 
     # 3) OI - kapanmis mum (timestamp hizali)
+    # SINYAL: kontrat (sumOpenInterest) kullan -> fiyat cift sayilmaz (notional fiyati icerir,
+    #   kosul zaten fiyata ayri bakiyor). Saf pozisyon akisi = "yeni para girdi mi" temiz cevap.
+    # GOSTERIM: notional (sumOpenInterestValue, USD) -> diger borsalarla tutarli, anlamli dolar degeri.
     oi = safe(lambda: http_get_cached(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period={p}&limit=6"), [])
     oic = _closed_points(oi)
+    # Kontrat (sinyal icin)
+    oi_contract_now = float(oic[-1].get("sumOpenInterest") or 0) if oic else None
+    oi_contract_prev = float(oic[-2].get("sumOpenInterest") or 0) if oic and len(oic) >= 2 else None
+    # Notional (gosterim icin, USD)
     oi_now = float(oic[-1].get("sumOpenInterestValue") or 0) if oic else None
-    oi_prev = float(oic[-2].get("sumOpenInterestValue") or 0) if oic and len(oic) >= 2 else None
+    # oi_change KONTRATTAN hesaplanir (saf pozisyon degisimi, fiyat etkisi yok)
     oi_change = None
-    if oi_now and oi_prev and oi_prev > 0:
-        oi_change = (oi_now - oi_prev) / oi_prev * 100
+    if oi_contract_now and oi_contract_prev and oi_contract_prev > 0:
+        oi_change = (oi_contract_now - oi_contract_prev) / oi_contract_prev * 100
 
     # 4) Fiyat - kline (EMA icin 400 mum). Son eleman CANLI mum - EMA icin tut ama
     #    fiyat trendi icin kapanmis kullan.
@@ -495,6 +528,8 @@ def fetch_h1_data(sym):
         "retail2ago": retail_prev,
         "oiNow": oi_now,
         "oiChange": oi_change,
+        "oiContractNow": oi_contract_now,
+        "oiContractPrev": oi_contract_prev,
         "takerBuyNow": taker_buy_now,
         "takerBuy2ago": taker_buy_prev,
         "funding": funding,
