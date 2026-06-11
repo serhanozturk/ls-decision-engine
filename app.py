@@ -1,8 +1,19 @@
 """
-L/S DECISION ENGINE v10 - H1 REJIM SISTEMI
+L/S DECISION ENGINE v11 - H1 REJIM SISTEMI
 ==========================================
 Tek timeframe (H1). EMA365 rejim. 5 kosullu boga/ayi puanlama.
 EMA7/30 kesisimi cikis sinyali. Pozisyon farkindaligi. Gunduz/gece modu.
+
+v11 degisiklikleri:
+- VERI TAZELIK kontrolu (STALE kok cozumu): her endpoint ts'i beklenen mumla
+  karsilastirilir; dataExact/dataFresh alanlari + dashboard VERI BAYAT uyarisi
+- Snapshot dataExact sart: bayat/yanlis-etiketli kayit imkansiz
+- Bybit/OKX/Bitget cache'lendi (her analyze ~7-9 harici cagri -> ~3x azalma)
+- 4/5 GUCLU AC kademesi eklendi (3/5 AC, 4/5 GUCLU AC, 5/5 KESIN)
+- Canli fiyat TTL 30s (eskiden 120s - "Canli" artik gercekten canli)
+- Binance 5xx gecici hatalarinda 1 retry
+- save_snapshot tek Supabase GET (eskiden 2)
+- Temizlik: olu is_flat, kullanilmayan as_completed; SCORE_GAMBLE -> SCORE_MIN_ENTRY
 """
 
 import http.server
@@ -13,7 +24,7 @@ import urllib.error
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 PORT = int(os.environ.get("PORT", 8765))
 HOST = "0.0.0.0"
@@ -39,9 +50,9 @@ THRESHOLDS = {
 }
 
 # Karar dereceleri (5 kosul uzerinden)
-SCORE_STRONG = 5   # 5/5 KESIN
-SCORE_OPEN   = 4   # 4/5 AC
-SCORE_GAMBLE = 3   # 3/5 GAMBLE
+SCORE_STRONG    = 5   # 5/5 KESIN
+SCORE_OPEN      = 4   # 4/5 GUCLU AC
+SCORE_MIN_ENTRY = 3   # 3/5 minimum giris esigi (trend yonu girisler icin)
 
 
 import time as _time
@@ -100,6 +111,10 @@ def http_get(url, timeout=10, retries=2):
                     _set_binance_ban(ban_secs)
                 # Banlandiysa tekrar denemenin anlami yok, hemen cik
                 raise
+            # 5xx gecici sunucu hatalari (502/503 vb): kisa bekleyip 1 kez daha dene
+            if e.code >= 500 and attempt < retries:
+                _time.sleep(0.5)
+                continue
             raise
         except Exception as e:
             last_err = e
@@ -120,10 +135,12 @@ CACHE_TTL = {
     "openInterest": 180,
     "taker": 180,
     "premium": 180,
+    "ticker": 30,        # canli fiyat - kisa TTL (gercekten "canli" olsun)
     "default": 120,
 }
 
 def _ttl_for(url):
+    if "ticker/price" in url: return CACHE_TTL["ticker"]
     if "klines" in url: return CACHE_TTL["klines"]
     if "globalLongShort" in url: return CACHE_TTL["globalLong"]
     if "topLongShort" in url: return CACHE_TTL["topLong"]
@@ -248,19 +265,30 @@ def get_signal_history(symbol, limit=50):
 
 # --- IZOLE SNAPSHOT TEST FONKSIYONLARI (mevcut sistemi etkilemez) ---
 def save_snapshot(symbol="BTC"):
-    """5 gunluk OI/CVD matris testi icin saatlik snapshot. Histerezis: 50dk."""
+    """5 gunluk OI/CVD matris testi icin saatlik snapshot. Histerezis: 50dk.
+    TEK Supabase GET ile hem histerezis hem STALE kontrolu yapilir."""
     if not SUPABASE_ENABLED:
         return {"ok": False, "error": "supabase kapali"}
-    # Histerezis: son kayittan 50dk gecmediyse atla (saatte bir olsun, 30dk cron'larin biri atlanir)
+
+    # Son kaydi TEK sorguda al (histerezis + candle/deger kontrolu ikisi de kullanir)
+    prev_row = None
     try:
-        latest = supabase_request("GET", "snapshots?order=ts.desc&limit=1")
-        if latest and len(latest) > 0:
+        rows = supabase_request("GET", f"snapshots?symbol=eq.{symbol}&order=ts.desc&limit=1")
+        if rows and len(rows) > 0:
+            prev_row = rows[0]
+    except Exception:
+        prev_row = None
+
+    # Histerezis: son kayittan 50dk gecmediyse atla (saatte bir kayit)
+    if prev_row:
+        try:
             from datetime import datetime, timezone, timedelta
-            last_ts = datetime.fromisoformat(latest[0].get("ts", "").replace("Z", "+00:00"))
+            last_ts = datetime.fromisoformat(prev_row.get("ts", "").replace("Z", "+00:00"))
             if datetime.now(timezone.utc) - last_ts < timedelta(minutes=50):
                 return {"ok": True, "saved": False, "reason": "50dk gecmedi (saatlik kayit)"}
-    except Exception:
-        pass
+        except Exception:
+            pass
+
     # analyze_symbol'u CAGIRRIR (degistirmez) - veriyi oradan alir
     res = analyze_symbol(symbol, "flat", None)
     if not res.get("ok"):
@@ -270,30 +298,29 @@ def save_snapshot(symbol="BTC"):
     c = dec.get("conditions", {})
     st = res.get("serverTime", {})  # tr/utc/candle zaman bilgisi (analyze_symbol uretir)
 
-    # ===== STALE/TEKRAR KORUMASI =====
-    # Ban veya veri kesintisinde sistem eski mumu tekrar yazabiliyordu (STALE).
-    # Iki kontrol:
-    #  1) candle_tr (analiz edilen mum) son kayitla AYNIYSA -> ayni mumu tekrar kaydetme
-    #  2) price+oi+cvd son kayitla BIREBIR ayniysa -> Binance verisi guncellenmemis (bayat)
+    # ===== STALE KORUMASI (3 katman) =====
+    # 1) KOK COZUM - veri tazeligi: herhangi bir parca (fiyat/oi/cvd/global/whale)
+    #    beklenen kapanmis mumdan GERIDEYSE kaydetme. Boylece yanlis etiketli
+    #    (candle_tr saat-bazli, veri eski) kayit imkansiz hale gelir.
+    if not d.get("dataExact", True):
+        parts = ",".join(d.get("nonExactParts") or [])
+        return {"ok": True, "saved": False,
+                "reason": f"veri tam guncel degil ({parts}) - STALE atlandi",
+                "dataCandleTR": d.get("dataCandleTR")}
+    # 2) Ayni mum (candle_tr) tekrar -> atla
     this_candle = st.get("shownCandleFullTR")
-    this_price = d.get("priceNow")
-    this_oi = d.get("oiNow")
-    this_cvd = d.get("takerBuyNow")
-    try:
-        prev = supabase_request("GET", f"snapshots?symbol=eq.{symbol}&order=ts.desc&limit=1")
-        if prev and len(prev) > 0:
-            p = prev[0]
-            # 1) Ayni mum (candle_tr) tekrar -> atla
-            if this_candle and p.get("candle_tr") == this_candle:
-                return {"ok": True, "saved": False, "reason": f"ayni mum ({this_candle}) zaten kayitli"}
-            # 2) Deger birebir ayni (veri guncellenmemis = bayat/STALE) -> atla
-            same_price = (this_price is not None and p.get("price") == this_price)
-            same_oi = (this_oi is not None and p.get("oi") == this_oi)
-            same_cvd = (this_cvd is not None and p.get("cvd") == this_cvd)
-            if same_price and same_oi and same_cvd:
-                return {"ok": True, "saved": False, "reason": "veri bayat (price+oi+cvd onceki ile birebir ayni) - STALE atlandi"}
-    except Exception:
-        pass
+    if prev_row and this_candle and prev_row.get("candle_tr") == this_candle:
+        return {"ok": True, "saved": False, "reason": f"ayni mum ({this_candle}) zaten kayitli"}
+    # 3) Deger birebir ayni (ek guvenlik) -> atla
+    if prev_row:
+        this_price = d.get("priceNow")
+        this_oi = d.get("oiNow")
+        this_cvd = d.get("takerBuyNow")
+        same_price = (this_price is not None and prev_row.get("price") == this_price)
+        same_oi = (this_oi is not None and prev_row.get("oi") == this_oi)
+        same_cvd = (this_cvd is not None and prev_row.get("cvd") == this_cvd)
+        if same_price and same_oi and same_cvd:
+            return {"ok": True, "saved": False, "reason": "veri bayat (price+oi+cvd onceki ile birebir ayni) - STALE atlandi"}
 
     body = {
         "symbol": symbol,
@@ -379,6 +406,26 @@ def _closed_points(arr, ts_key="timestamp"):
     return closed
 
 
+def _fresh_age(actual_ts, expected_ts, now_ms, cur_hour_open):
+    """Verinin kac mum geride oldugunu hesaplar.
+    age=0  -> tam guncel (beklenen kapanmis mum)
+    age=1+ -> geride (ban/cache/endpoint gecikmesi)
+    fresh  -> gosterim icin: age 0 VEYA (age 1 + saat basinin ilk 5dk'si = endpoint
+              henuz yayinlamamis olabilir, normal gecikme)
+    Donus: (age, fresh). actual_ts yoksa (None, True) - veri yoklugu ayri ele alinir."""
+    if actual_ts is None:
+        return None, True
+    try:
+        age = int(round((expected_ts - actual_ts) / 3600000))
+    except Exception:
+        return None, True
+    if age <= 0:
+        return 0, True
+    if age == 1 and (now_ms - cur_hour_open) < 300000:  # ilk 5 dk tolerans
+        return 1, True
+    return age, False
+
+
 def fetch_h1_data(sym):
     """BTC H1 verisi - SADECE KAPANMIS MUMLAR (canli mum atlanir, stabilite icin).
 
@@ -386,6 +433,10 @@ def fetch_h1_data(sym):
     timestamp hizalamasiyla atilir (_closed_points). Boylece OI/CVD ile kline
     ayni kapanmis muma denk gelir (eski kor [:-1] kaymasi giderildi)."""
     p = "1h"
+    # Tazelik kontrolu icin beklenen "son kapanmis mum" acilis zamani
+    _now_ms = _time.time() * 1000
+    _cur_hour_open = _now_ms - (_now_ms % 3600000)
+    _expected_ts = _cur_hour_open - 3600000  # son kapanmis mumun acilis ts'i (ms)
 
     # 1) Global L/S account ratio
     g = http_get_cached(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={sym}&period={p}&limit=6")
@@ -432,6 +483,8 @@ def fetch_h1_data(sym):
     price_now = closes_closed[-1]    # son KAPANMIS fiyat
     price_prev = closes_closed[-2] if len(closes_closed) >= 2 else closes_closed[0]
     price_change = (price_now - price_prev) / price_prev * 100 if price_prev > 0 else None
+    # Veri mumu zamani (kline son kapanmis mumun ACILIS ts'i) - tazelik kontrolu icin
+    kline_ts = int(kl[-2][0]) if len(kl) >= 2 else None
 
     # Hacim (Binance kline volume = k[5]) - kapanmis mum. Teyit icin: son mum vs son N mum ortalamasi
     vols_all = [float(k[5]) for k in kl]
@@ -517,8 +570,42 @@ def fetch_h1_data(sym):
             elif (not up_now) and (not up_prev):
                 ema_cross_down = True     # 2 mumdur EMA7 altta = asagi onayli
 
+    # ===== VERI TAZELIK KONTROLU (STALE kok cozumu) =====
+    # Her endpoint'in son kapanmis mum ts'ini beklenen ile karsilastir.
+    # age=0 tum parcalar -> dataExact (snapshot icin sart)
+    # grace'li fresh -> dataFresh (dashboard uyarisi icin)
+    _parts_ts = {
+        "fiyat": kline_ts,
+        "oi": (oic[-1].get("timestamp") if oic else None),
+        "cvd": (cvdc[-1].get("timestamp") if cvdc else None),
+        "global": (gc[-1].get("timestamp") if gc else None),
+        "whale": (tc[-1].get("timestamp") if tc else None),
+    }
+    stale_parts = []      # gosterim: grace'i asan bayat parcalar
+    nonexact_parts = []   # snapshot: age>0 olan TUM parcalar (grace yok, kesin)
+    for _name, _ts in _parts_ts.items():
+        _age, _fr = _fresh_age(_ts, _expected_ts, _now_ms, _cur_hour_open)
+        if _age is None:
+            continue  # veri yok - ayri ele aliniyor (None alanlar)
+        if _age > 0:
+            nonexact_parts.append(f"{_name}({_age}mum)")
+        if not _fr:
+            stale_parts.append(f"{_name}({_age}mum)")
+    data_fresh = len(stale_parts) == 0
+    data_exact = len(nonexact_parts) == 0
+    # Verinin gercekte ait oldugu mum (TR) - etiket dogrulamasi icin
+    data_candle_tr = None
+    if kline_ts:
+        _t = _time.gmtime((kline_ts / 1000) + 3 * 3600)
+        data_candle_tr = _time.strftime("%d.%m.%Y %H:%M", _t) + " TR"
+
     return {
         "ok": True,
+        "dataFresh": data_fresh,        # gosterim: grace'li tazelik
+        "dataExact": data_exact,        # snapshot: tum parcalar tam guncel mi
+        "staleParts": stale_parts,      # bayat parcalar (grace asildi)
+        "nonExactParts": nonexact_parts,# age>0 tum parcalar (kesin liste)
+        "dataCandleTR": data_candle_tr, # verinin GERCEK mumu (TR)
         "priceNow": price_now,
         "priceChange": price_change,
         "globalLongNow": global_long_now,
@@ -688,13 +775,9 @@ def decide(symbol, d, user_position, entry_price=None):
     else:
         regime = "GECIS"
 
-    # YATAY kontrolu: fiyat EMA365'e cok yakin VEYA iki skor da dusuk
-    is_flat = False
+    # YATAY: fiyat EMA365'in ±flat_band bandinda ise rejim YATAY
     if dist is not None and abs(dist) < flat_band:
-        is_flat = True
         regime = "YATAY"
-    if bull_score <= 2 and bear_score <= 2:
-        is_flat = True
 
     # PnL
     pnl_pct = None
@@ -760,9 +843,11 @@ def _decide_flat(bull, bear, cross_up, cross_down, regime):
                 return "REBOUND_LONG", "GUCLU TEPKI LONG", f"Ayi rejimde yukari kesisim + boga {bull}/5 - tepki gucleniyor (spekulatif)"
             return "REBOUND_LONG", "TEPKI LONG", f"Ayi rejimde yukari kesisim (boga {bull}/5) - zayif tepki, dikkatli"
         # Rejim boga/gecis -> normal LONG mantigi (trend yonu)
-        if bull >= SCORE_GAMBLE:
+        if bull >= SCORE_MIN_ENTRY:
             if bull >= SCORE_STRONG:
                 return "LONG_OPEN", "KESIN BOGA - LONG AC", f"Yukari kesisim + boga {bull}/5 (tam teyit)"
+            if bull >= SCORE_OPEN:
+                return "LONG_OPEN", "GUCLU LONG AC", f"Yukari kesisim + boga {bull}/5 (guclu teyit)"
             return "LONG_OPEN", "LONG AC", f"Yukari kesisim + boga {bull}/5 teyit"
         return "FLAT", "BEKLE", f"Yukari kesisim ama yon zayif (boga {bull}/5) - teyit yok"
 
@@ -774,9 +859,11 @@ def _decide_flat(bull, bear, cross_up, cross_down, regime):
                 return "PULLBACK_SHORT", "GUCLU DUZELTME SHORT", f"Boga rejimde asagi kesisim + ayi {bear}/5 - duzeltme gucleniyor (spekulatif)"
             return "PULLBACK_SHORT", "DUZELTME SHORT", f"Boga rejimde asagi kesisim (ayi {bear}/5) - zayif duzeltme, dikkatli"
         # Rejim ayi/gecis -> normal SHORT mantigi (trend yonu)
-        if bear >= SCORE_GAMBLE:
+        if bear >= SCORE_MIN_ENTRY:
             if bear >= SCORE_STRONG:
                 return "SHORT_OPEN", "KESIN AYI - SHORT AC", f"Asagi kesisim + ayi {bear}/5 (tam teyit)"
+            if bear >= SCORE_OPEN:
+                return "SHORT_OPEN", "GUCLU SHORT AC", f"Asagi kesisim + ayi {bear}/5 (guclu teyit)"
             return "SHORT_OPEN", "SHORT AC", f"Asagi kesisim + ayi {bear}/5 teyit"
         return "FLAT", "BEKLE", f"Asagi kesisim ama yon zayif (ayi {bear}/5) - teyit yok"
 
@@ -831,7 +918,7 @@ def _decide_short(bull, bear, cross_up, cross_down, pnl_pct, regime):
 
 def bybit_summary(sym):
     try:
-        j = http_get(f"https://api.bybit.com/v5/market/account-ratio?category=linear&symbol={sym}&period=1h&limit=1")
+        j = http_get_cached(f"https://api.bybit.com/v5/market/account-ratio?category=linear&symbol={sym}&period=1h&limit=1")
         if j.get("retCode") != 0:
             return {"ok": False, "error": j.get("retMsg")}
         lst = (j.get("result") or {}).get("list") or []
@@ -839,7 +926,7 @@ def bybit_summary(sym):
             return {"ok": False, "error": "NO DATA"}
         long_pct = float(lst[0]["buyRatio"]) * 100
         oi = funding = None
-        t = safe(lambda: http_get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}"), {})
+        t = safe(lambda: http_get_cached(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}"), {})
         l2 = (t.get("result") or {}).get("list") or []
         if l2:
             tk = l2[0]
@@ -854,16 +941,16 @@ def okx_summary(symbol):
     ccy = symbol.replace("USDT", "")
     inst = f"{ccy}-USDT-SWAP"
     try:
-        j = http_get(f"https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={ccy}&period=1H&limit=1")
+        j = http_get_cached(f"https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={ccy}&period=1H&limit=1")
         if j.get("code") != "0" or not j.get("data"):
             return {"ok": False, "error": "NO DATA"}
         ratio = float(j["data"][0][1])
         long_pct = ratio / (1 + ratio) * 100
         oi = funding = None
-        oj = safe(lambda: http_get(f"https://www.okx.com/api/v5/public/open-interest?instId={inst}"), {})
+        oj = safe(lambda: http_get_cached(f"https://www.okx.com/api/v5/public/open-interest?instId={inst}"), {})
         if oj.get("code") == "0" and oj.get("data") and oj["data"][0].get("oiUsd"):
             oi = float(oj["data"][0]["oiUsd"])
-        fj = safe(lambda: http_get(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"), {})
+        fj = safe(lambda: http_get_cached(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"), {})
         if fj.get("code") == "0" and fj.get("data"):
             funding = float(fj["data"][0]["fundingRate"]) * 100
         return {"ok": True, "longPct": long_pct, "shortPct": 100-long_pct, "openInterest": oi, "fundingRate": funding}
@@ -873,23 +960,23 @@ def okx_summary(symbol):
 
 def bitget_summary(sym):
     try:
-        j = http_get(f"https://api.bitget.com/api/v2/mix/market/account-long-short?symbol={sym}&period=1h&productType=USDT-FUTURES&limit=1")
+        j = http_get_cached(f"https://api.bitget.com/api/v2/mix/market/account-long-short?symbol={sym}&period=1h&productType=USDT-FUTURES&limit=1")
         if j.get("code") != "00000" or not j.get("data"):
             return {"ok": False, "error": "NO DATA"}
         long_pct = float(j["data"][0]["longAccountRatio"]) * 100
         oi = funding = None
-        oj = safe(lambda: http_get(f"https://api.bitget.com/api/v2/mix/market/open-interest?symbol={sym}&productType=USDT-FUTURES"), {})
+        oj = safe(lambda: http_get_cached(f"https://api.bitget.com/api/v2/mix/market/open-interest?symbol={sym}&productType=USDT-FUTURES"), {})
         if oj.get("code") == "00000":
             ol = (oj.get("data") or {}).get("openInterestList") or []
             if ol:
                 qty = float(ol[0].get("size") or 0)
-                tj = safe(lambda: http_get(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES"), {})
+                tj = safe(lambda: http_get_cached(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES"), {})
                 td = tj.get("data")
                 if td:
                     if isinstance(td, list): td = td[0]
                     price = float(td.get("lastPr") or 0)
                     oi = qty * price if price else None
-        fj = safe(lambda: http_get(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={sym}&productType=USDT-FUTURES"), {})
+        fj = safe(lambda: http_get_cached(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={sym}&productType=USDT-FUTURES"), {})
         if fj.get("code") == "00000":
             fd = fj.get("data") or []
             if isinstance(fd, list) and fd: funding = float(fd[0].get("fundingRate") or 0) * 100
@@ -984,6 +1071,11 @@ def analyze_symbol(symbol, user_position, entry_price=None):
         "closedPrice": d.get("priceNow"),  # son kapanmis mum fiyati (sistemin analiz ettigi)
         "livePrice": live_price,           # acik/anlik fiyat (None olabilir)
         "serverTime": _server_time(),
+        # Veri tazeligi (STALE gorunurlugu): bayatsa dashboard uyari gosterir
+        "dataFresh": d.get("dataFresh", True),
+        "dataExact": d.get("dataExact", True),
+        "staleParts": d.get("staleParts", []),
+        "dataCandleTR": d.get("dataCandleTR"),
         "decision": decision, "data": d, "exchanges": exchanges,
         "signalSaved": saved,
     }
@@ -1115,7 +1207,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Decision Engine v10 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Decision Engine v11 listening on {HOST}:{PORT}", flush=True)
     print(f"Supabase: {'ENABLED' if SUPABASE_ENABLED else 'DISABLED'}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), Handler) as srv:
@@ -1418,7 +1510,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="grid" id="cards"></div>
 
   <div class="info">
-    <b>v10 - H1 REJIM SISTEMI:</b> Tek timeframe (H1). EMA365 boga/ayi rejimini belirler.<br><br>
+    <b>v11 - H1 REJIM SISTEMI:</b> Tek timeframe (H1). EMA365 boga/ayi rejimini belirler.<br><br>
     <b>5 KOSUL:</b> (1) Fiyat EMA365 tarafi (2+ mum), (2) W/R >= 3 veya <= -3, (3) Retail trendi, (4) OI+fiyat yonu, (5) CVD+fiyat yonu. Her kosul 1/0.<br><br>
     <b>GIRIS (rejim YONUNDE):</b> Kesisim + ayni yon 3/5 -> AC, 4/5 GUCLU, 5/5 KESIN.<br><br>
     <b>TEPKI/DUZELTME (rejime TERS):</b> Ayi rejimde yukari kesisim -> TEPKI LONG (boga>=2 GUCLU). Boga rejimde asagi kesisim -> DUZELTME SHORT (ayi>=2 GUCLU). Ana trende ters, spekulatif - dikkatli. Rejim degisince etiket otomatik normale doner.<br><br>
@@ -1510,7 +1602,15 @@ function renderDecision(symbol, data) {
   const ci = document.getElementById('candleInfo');
   if (ci) {
     const closedTxt = data.closedPrice ? '$'+data.closedPrice.toLocaleString('en-US',{maximumFractionDigits:2}) : '--';
-    ci.textContent = `Analiz: ${st.shownCandleTR||'--'} ($${(data.closedPrice||0).toLocaleString('en-US',{maximumFractionDigits:2})}) \u00b7 ${st.tr||''}`;
+    let txt = `Analiz: ${st.shownCandleTR||'--'} ($${(data.closedPrice||0).toLocaleString('en-US',{maximumFractionDigits:2})}) \u00b7 ${st.tr||''}`;
+    // VERI BAYAT uyarisi: herhangi bir veri parcasi beklenen mumdan gerideyse
+    if (data.dataFresh === false) {
+      const parts = (data.staleParts||[]).join(', ');
+      const realCandle = data.dataCandleTR ? ` \u00b7 gercek veri mumu: ${data.dataCandleTR}` : '';
+      ci.innerHTML = txt + `<br><span style="color:var(--red);font-weight:700">\u26A0 VERI BAYAT: ${parts}${realCandle}</span>`;
+    } else {
+      ci.textContent = txt;
+    }
   }
 
   // Kosul matrisi
