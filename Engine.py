@@ -1,5 +1,11 @@
 """
-L/S DECISION ENGINE v12 - H1 REJIM SISTEMI
+L/S DECISION ENGINE v13 - H1 REJIM SISTEMI
+
+v13: EMA365 KOK DUZELTME. Kline limiti 400 -> 1500. EMA365, 400 mumla yetersiz
+  isiniyordu (~%2 dusuk cikiyor, fiyat altindayken 'ustunde' diyip yanlis rejim
+  uretiyordu - GUCLU BOGA hatasi). 1500 mum (Binance tek istek max) ile EMA365
+  TradingView'e yakinsiyor. Diger hesaplar (fiyat/hacim/CVD/kisa EMA) listenin
+  SONUNDAN aldigi icin ETKILENMEDI. Ban riski yok (tek coin, klines weight 10).
 ==========================================
 Tek timeframe (H1). EMA365 rejim. 5 kosullu boga/ayi puanlama.
 EMA7/30 kesisimi cikis sinyali. Pozisyon farkindaligi. Gunduz/gece modu.
@@ -504,9 +510,11 @@ def fetch_h1_data(sym):
     if oi_contract_now and oi_contract_prev and oi_contract_prev > 0:
         oi_change = (oi_contract_now - oi_contract_prev) / oi_contract_prev * 100
 
-    # 4) Fiyat - kline (EMA icin 400 mum). Son eleman CANLI mum - EMA icin tut ama
-    #    fiyat trendi icin kapanmis kullan.
-    kl = http_get_cached(f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval={p}&limit=400")
+    # 4) Fiyat - kline (EMA365 icin 1500 mum). EMA365'in dogru "isinmasi" icin
+    #    365'in birkac kati mum gerekir; 400 mum yetersizdi (EMA365 ~%2 dusuk cikiyordu,
+    #    yanlis rejim uretiyordu). 1500 = Binance tek istek max. Son eleman CANLI mum.
+    #    DIGER hesaplar (fiyat, hacim, kisa EMA) listenin SONUNDAN aldigi icin etkilenmez.
+    kl = http_get_cached(f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval={p}&limit=1500")
     if not kl or len(kl) < 2:
         raise RuntimeError("kline verisi yetersiz (yeni coin veya eksik cevap)")
     closes_all = [float(k[4]) for k in kl]  # canli mum dahil (EMA hesabi icin)
@@ -1238,7 +1246,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Decision Engine v12 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Decision Engine v13 listening on {HOST}:{PORT}", flush=True)
     print(f"Supabase: {'ENABLED' if SUPABASE_ENABLED else 'DISABLED'}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), Handler) as srv:
@@ -1541,7 +1549,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="grid" id="cards"></div>
 
   <div class="info">
-    <b>v12 - H1 REJIM SISTEMI:</b> Tek timeframe (H1). EMA365 boga/ayi rejimini belirler.<br><br>
+    <b>v13 - H1 REJIM SISTEMI:</b> Tek timeframe (H1). EMA365 boga/ayi rejimini belirler.<br><br>
     <b>5 KOSUL:</b> (1) Fiyat EMA365 tarafi (2+ mum), (2) W/R >= 3 veya <= -3, (3) Retail trendi, (4) OI+fiyat yonu, (5) CVD+fiyat yonu. Her kosul 1/0.<br><br>
     <b>GIRIS (rejim YONUNDE):</b> Kesisim + ayni yon 3/5 -> AC, 4/5 GUCLU, 5/5 KESIN.<br><br>
     <b>TEPKI/DUZELTME (rejime TERS):</b> Ayi rejimde yukari kesisim -> TEPKI LONG (boga>=2 GUCLU). Boga rejimde asagi kesisim -> DUZELTME SHORT (ayi>=2 GUCLU). Ana trende ters, spekulatif - dikkatli. Rejim degisince etiket otomatik normale doner.<br><br>
